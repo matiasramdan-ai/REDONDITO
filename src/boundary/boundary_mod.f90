@@ -15,12 +15,17 @@ MODULE boundary
          INTEGER  :: bcint,bcext
       ENDTYPE BCPLAN
 
-      ! Factorizaciones LU de las matrices B_l de la recuperación de W
-      ! (invDl), una por cada l de 1 a lmax, con sus pivotes y la
-      ! escala de cada fila
-      REAL(KIND=GP), ALLOCATABLE, DIMENSION(:,:,:) :: blu
-      REAL(KIND=GP), ALLOCATABLE, DIMENSION(:,:)   :: besc
-      INTEGER, ALLOCATABLE, DIMENSION(:,:)         :: bpiv
+      ! Para cada l de 1 a lmax, M_l: las columnas 3 a N-2 de B_l^-1
+      ! (binv), con B_l la matriz de la recuperación de W, así que
+      ! W = M_l phi(3:N-2) (invDl)
+      REAL(KIND=GP), ALLOCATABLE, DIMENSION(:,:,:) :: binv
+      ! Los lm de la tarea ordenados por l (lmord), con los de cada l
+      ! entre lmini(l) y lmini(l+1)-1, y los arreglos de trabajo de invDl
+      INTEGER, ALLOCATABLE, DIMENSION(:)         :: lmini,lmord
+      REAL(KIND=GP), ALLOCATABLE, DIMENSION(:,:) :: bphi,bw
+
+      ! Las filas 1, 2, N-1 y N de la matriz de d2/dr2 (v_imposebc_fast)
+      REAL(KIND=GP), ALLOCATABLE, DIMENSION(:,:) :: d2bor
 
       CONTAINS
 
@@ -134,53 +139,60 @@ MODULE boundary
 !**********************************************************************
       SUBROUTINE invDl_setup()
 !----------------------------------------------------------------------
-!  Arma y factoriza, para cada l de 1 a lmax, la matriz B_l de la
-! recuperación de W a partir de phi = D_l W, en los N = nz-Cz puntos
-! físicos (cuenta 4, ec. 14):
+!  Arma, para cada l de 1 a lmax, la matriz B_l de la recuperación de W
+! a partir de phi = D_l W, en los N = nz-Cz puntos físicos (cuenta 4,
+! ec. 14):
 !    fila 1        : W = 0 en rint
 !    fila 2        : dW/dr = 0 en rint (fila 1 de la matriz de d/dr)
 !    filas 3 a N-2 : D_l W = phi (filas de la matriz de d2/dr2, menos
 !                    l(l+1)/r**2 en la diagonal)
 !    fila N-1      : dW/dr = 0 en rext (fila N de la matriz de d/dr)
 !    fila N        : W = 0 en rext
-! Cada fila se divide por su máximo valor absoluto (besc) y la matriz
-! se factoriza con LU (blu, bpiv). Cada tarea guarda todos los l,
-! porque sus lm tienen casi todos. Se llama una vez, con gdev_active
-! falso.
+! Divide cada fila por su máximo valor absoluto (la diagonal S),
+! factoriza S^-1 B_l con LU y con ella calcula M_l, las columnas 3 a
+! N-2 de B_l^-1 (binv), las únicas que usa P phi: así invDl es un
+! producto de matrices. El escalado solo mejora el redondeo de la LU,
+! porque (S^-1 B_l)^-1 S^-1 = B_l^-1. También arma la tabla de los lm
+! de la tarea por l y guarda las filas de borde de d2/dr2. Cada tarea
+! guarda todos los l, porque sus lm tienen casi todos. Se llama una
+! vez, con gdev_active falso.
 !----------------------------------------------------------------------
       USE fprecision
       USE commtypes
       USE grid
+      USE kes
       USE mpivars
       IMPLICIT NONE
 
-      REAL(KIND=GP), ALLOCATABLE, DIMENSION(:,:) :: d1,d2
-      INTEGER :: n,l,i,info
+      REAL(KIND=GP), ALLOCATABLE, DIMENSION(:,:) :: d1,d2,b
+      REAL(KIND=GP), ALLOCATABLE, DIMENSION(:)   :: esc
+      INTEGER, ALLOCATABLE, DIMENSION(:)         :: piv
+      INTEGER :: n,l,i,info,j,lm
 
       n = nz-Cz
-      ALLOCATE( d1(n,n),d2(n,n) )
-      ALLOCATE( blu(n,n,lmax),besc(n,lmax),bpiv(n,lmax) )
+      ALLOCATE( d1(n,n),d2(n,n),b(n,n),esc(n),piv(n) )
+      ALLOCATE( binv(n,n-4,lmax) )
       CALL derivr_mat(1,d1)
       CALL derivr_mat(2,d2)
 
       DO l = 1,lmax
-         blu(:,:,l) = 0.0_GP
-         blu(1,1,l) = 1.0_GP
-         blu(2,:,l) = d1(1,:)
+         b = 0.0_GP
+         b(1,1) = 1.0_GP
+         b(2,:) = d1(1,:)
          DO i = 3,n-2
-            blu(i,:,l) = d2(i,:)
-            blu(i,i,l) = blu(i,i,l) - l*(l+1)/z(i)**2
+            b(i,:) = d2(i,:)
+            b(i,i) = b(i,i) - l*(l+1)/z(i)**2
          END DO
-         blu(n-1,:,l) = d1(n,:)
-         blu(n,n,l) = 1.0_GP
+         b(n-1,:) = d1(n,:)
+         b(n,n) = 1.0_GP
          DO i = 1,n
-            besc(i,l) = MAXVAL(ABS(blu(i,:,l)))
-            blu(i,:,l) = blu(i,:,l)/besc(i,l)
+            esc(i) = MAXVAL(ABS(b(i,:)))
+            b(i,:) = b(i,:)/esc(i)
          END DO
 #if defined(GDOUBLE_PRECISION)
-         CALL DGETRF(n,n,blu(:,:,l),n,bpiv(:,l),info)
+         CALL DGETRF(n,n,b,n,piv,info)
 #else
-         CALL SGETRF(n,n,blu(:,:,l),n,bpiv(:,l),info)
+         CALL SGETRF(n,n,b,n,piv,info)
 #endif
          IF ( info .ne. 0 ) THEN
             IF ( myrank .eq. 0 ) PRINT*, "[ERROR] LU of B_l failed ", &
@@ -188,8 +200,42 @@ MODULE boundary
             CALL MPI_FINALIZE(ierr)
             STOP
          ENDIF
+! Las columnas 3 a N-2 de B_l^-1: S^-1 B_l M_l = esas columnas de S^-1
+         binv(:,:,l) = 0.0_GP
+         DO j = 1,n-4
+            binv(j+2,j,l) = 1.0_GP/esc(j+2)
+         END DO
+#if defined(GDOUBLE_PRECISION)
+         CALL DGETRS('N',n,n-4,b,n,piv,binv(:,:,l),n,info)
+#else
+         CALL SGETRS('N',n,n-4,b,n,piv,binv(:,:,l),n,info)
+#endif
       END DO
-      DEALLOCATE( d1,d2 )
+
+! Los lm de la tarea ordenados por l, para resolver juntos los que
+! comparten B_l
+      ALLOCATE( lmini(0:lmax+1),lmord(lmend-lmsta+1) )
+      ALLOCATE( bphi(n-4,2*(lmax+1)),bw(n,2*(lmax+1)) )
+      j = 0
+      DO l = 0,lmax
+         lmini(l) = j+1
+         DO lm = lmsta,lmend
+            IF ( ell(lm) .eq. l ) THEN
+               j = j+1
+               lmord(j) = lm
+            ENDIF
+         END DO
+      END DO
+      lmini(lmax+1) = j+1
+
+! Las filas de d2/dr2 de los cuatro puntos de borde, para recalcular phi
+! solo ahí (v_imposebc_fast)
+      ALLOCATE( d2bor(4,n) )
+      d2bor(1,:) = d2(1,:)
+      d2bor(2,:) = d2(2,:)
+      d2bor(3,:) = d2(n-1,:)
+      d2bor(4,:) = d2(n,:)
+      DEALLOCATE( d1,d2,b,esc,piv )
 
       RETURN
       END SUBROUTINE invDl_setup
@@ -197,44 +243,49 @@ MODULE boundary
 !**********************************************************************
       SUBROUTINE invDl(a,b)
 !----------------------------------------------------------------------
-!  Recupera W a partir de phi = D_l W en (lm,r): para cada lm de la
-! tarea resuelve B_l W = P phi con la LU de invDl_setup, donde P phi
-! es phi con ceros en las filas 1, 2, N-1 y N (las de las condiciones
-! W = dW/dr = 0 en las paredes) y cada fila dividida por besc. Las
-! partes real e imaginaria van como dos columnas del lado derecho,
-! porque B_l es real. El modo l = 0 queda en cero (libertad de gauge),
-! y los puntos de la continuación también: la FFT en z los vuelve a
-! calcular. Corre en la CPU.
+!  Recupera W a partir de phi = D_l W en (lm,r): W = M_l phi(3:N-2),
+! con M_l las columnas 3 a N-2 de B_l^-1 (invDl_setup), cumple
+! D_l W = phi en los puntos 3 a N-2 y W = dW/dr = 0 en las paredes.
+! Los lm de la tarea con el mismo l comparten M_l y van juntos en un
+! solo DGEMM, con dos columnas por modo: las partes real e imaginaria,
+! porque M_l es real.
+! El modo l = 0 queda en cero (libertad de gauge), y los puntos de la
+! continuación también: la FFT en z los vuelve a calcular. Corre en la
+! CPU.
 !  ARGUMENTS:
 !    a : phi en (lm,r). [IN]
 !    b : W en (lm,r). [OUT]
 !----------------------------------------------------------------------
       USE fprecision
       USE grid
-      USE kes
       USE mpivars
       IMPLICIT NONE
 
       COMPLEX(KIND=GP), INTENT(IN), DIMENSION(lmsta:lmend,nz)  :: a
       COMPLEX(KIND=GP), INTENT(OUT), DIMENSION(lmsta:lmend,nz) :: b
-      REAL(KIND=GP), DIMENSION(nz-Cz,2) :: rhs
-      INTEGER :: n,lm,l,info
+      INTEGER :: n,l,i,j,nm
 
       n = nz-Cz
       b = 0.0_GP
-      DO lm = lmsta,lmend
-         l = ell(lm)
-         IF ( l .eq. 0 ) CYCLE
-         rhs(:,1) = REAL(a(lm,1:n),KIND=GP)/besc(:,l)
-         rhs(:,2) = AIMAG(a(lm,1:n))/besc(:,l)
-         rhs(1:2,:) = 0.0_GP
-         rhs(n-1:n,:) = 0.0_GP
+      DO l = 1,lmax
+         nm = lmini(l+1)-lmini(l)
+         IF ( nm .eq. 0 ) CYCLE
+         DO j = 1,nm
+            i = lmord(lmini(l)+j-1)
+            bphi(:,2*j-1) = REAL(a(i,3:n-2),KIND=GP)
+            bphi(:,2*j)   = AIMAG(a(i,3:n-2))
+         END DO
 #if defined(GDOUBLE_PRECISION)
-         CALL DGETRS('N',n,2,blu(:,:,l),n,bpiv(:,l),rhs,n,info)
+         CALL DGEMM('N','N',n,2*nm,n-4,1.0_GP,binv(:,:,l),n,bphi,n-4, &
+                    0.0_GP,bw,n)
 #else
-         CALL SGETRS('N',n,2,blu(:,:,l),n,bpiv(:,l),rhs,n,info)
+         CALL SGEMM('N','N',n,2*nm,n-4,1.0_GP,binv(:,:,l),n,bphi,n-4, &
+                    0.0_GP,bw,n)
 #endif
-         b(lm,1:n) = CMPLX(rhs(:,1),rhs(:,2),KIND=GP)
+         DO j = 1,nm
+            i = lmord(lmini(l)+j-1)
+            b(i,1:n) = CMPLX(bw(:,2*j-1),bw(:,2*j),KIND=GP)
+         END DO
       END DO
 
       RETURN

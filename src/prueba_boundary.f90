@@ -9,6 +9,8 @@
 !   cuatro filas de borde y en el modo l = 0.
 ! Mide las condiciones, que lo que no son paredes no cambie, que
 ! aplicarla dos veces dé lo mismo, y W contra W0 (error de truncado).
+! v_imposebc_fast, con las mismas entradas, tiene que dar el mismo W
+! y el mismo Z, y el mismo phi salvo el redondeo.
 ! Corre con cualquier cantidad de tareas y tiene que dar lo mismo.
 !=================================================================
 
@@ -32,8 +34,9 @@
       CHARACTER(len=15) :: bck(2)
       COMPLEX(KIND=GP), ALLOCATABLE :: z0(:,:),w0(:,:),f0(:,:)
       COMPLEX(KIND=GP), ALLOCATABLE :: tor(:,:),fi(:,:),pol(:,:),pol2(:,:)
+      COMPLEX(KIND=GP), ALLOCATABLE :: fs(:,:),tor3(:,:),fi3(:,:),pol3(:,:)
       REAL(KIND=GP), ALLOCATABLE :: d1(:,:)
-      REAL(KIND=GP) :: err(8),emax(8),dmax(2),gmax(2),r1,r2,wm
+      REAL(KIND=GP) :: err(10),emax(10),dmax(2),gmax(2),r1,r2,wm
       COMPLEX(KIND=GP) :: cl
       INTEGER :: n,k,lm
 
@@ -50,6 +53,8 @@
       ALLOCATE( z0(lmsta:lmend,nz),w0(lmsta:lmend,nz),f0(lmsta:lmend,nz) )
       ALLOCATE( tor(lmsta:lmend,nz),fi(lmsta:lmend,nz) )
       ALLOCATE( pol(lmsta:lmend,nz),pol2(lmsta:lmend,nz),d1(n,n) )
+      ALLOCATE( fs(lmsta:lmend,nz),tor3(lmsta:lmend,nz) )
+      ALLOCATE( fi3(lmsta:lmend,nz),pol3(lmsta:lmend,nz) )
       DO k = 1,nz
          DO lm = lmsta,lmend
             cl = CMPLX(1.0_GP+0.1_GP*lm,0.5_GP-0.05_GP*lm,KIND=GP)
@@ -68,6 +73,7 @@
       DO lm = lmsta,lmend
          IF (ell(lm).eq.0) fi(lm,:) = (5.0_GP,1.0_GP)
       END DO
+      fs = fi
       CALL v_imposebc(tor,fi,pol)
 
       err = 0.0_GP
@@ -95,8 +101,17 @@
       dmax(2) = MAXVAL(ABS(pol))
       CALL MPI_ALLREDUCE(dmax,gmax,2,GC_REAL,MPI_MAX,MPI_COMM_WORLD,ierr)
       err(7) = gmax(1)/gmax(2)
+! v_imposebc_fast con las mismas entradas que v_imposebc
+      tor3 = z0
+      fi3 = fs
+      CALL v_imposebc_fast(tor3,fi3,pol3)
+      err(9) = MAX(MAXVAL(ABS(pol3-pol)),MAXVAL(ABS(tor3-tor)))
+      dmax(1) = MAXVAL(ABS(fi3(:,1:n)-fi(:,1:n)))
+      dmax(2) = MAXVAL(ABS(fi(:,1:n)))
+      CALL MPI_ALLREDUCE(dmax,gmax,2,GC_REAL,MPI_MAX,MPI_COMM_WORLD,ierr)
+      err(10) = gmax(1)/gmax(2)
 
-      CALL MPI_REDUCE(err,emax,8,GC_REAL,MPI_MAX,0,MPI_COMM_WORLD,ierr)
+      CALL MPI_REDUCE(err,emax,10,GC_REAL,MPI_MAX,0,MPI_COMM_WORLD,ierr)
       IF (myrank.eq.0) THEN
          PRINT*, 'tareas:', nprocs, '  lmax =', lmax, '  nz =', nz
          PRINT*, 'tipos en las paredes:', bcp%bcint, bcp%bcext
@@ -108,6 +123,8 @@
          PRINT '(3X,A,ES10.2)', 'phi en el interior, cambio       :', emax(6)
          PRINT '(3X,A,ES10.2)', 'aplicarla dos veces, cambio de W :', emax(7)
          PRINT '(3X,A,ES10.2)', 'W contra W0 (truncado)           :', emax(8)
+         PRINT '(3X,A,ES10.2)', 'fast: W y Z contra v_imposebc    :', emax(9)
+         PRINT '(3X,A,ES10.2)', 'fast: phi contra v_imposebc      :', emax(10)
       ENDIF
       CALL terminar()
       CALL MPI_FINALIZE(ierr)

@@ -85,3 +85,46 @@
 
       RETURN
       END SUBROUTINE v_imposebc
+
+!***********************************************************************
+      SUBROUTINE v_imposebc_fast(tor,phi,pol)
+!-----------------------------------------------------------------------
+!  Lo mismo que v_imposebc, pero en el paso 3 recalcula phi = D_l W
+! solo en los puntos 1, 2, N-1 y N, con las filas de la matriz de
+! d2/dr2 que guarda invDl_setup (d2bor), y pone en cero el modo l = 0.
+! En los demás puntos deja el phi que entró, que ya es D_l W salvo el
+! redondeo, porque esas filas de B_l son las de D_l. W sale completo,
+! igual que en v_imposebc. Se ahorra las dos FFT en z de dlr.
+!  ARGUMENTS:
+!    tor : el potencial toroidal Z, en (lm,r). [INOUT]
+!    phi : phi = D_l W, en (lm,r). [INOUT]
+!    pol : el potencial poloidal W, en (lm,r). [OUT]
+!-----------------------------------------------------------------------
+      USE fprecision
+      USE grid, ONLY: nz,Cz,z
+      USE kes, ONLY: ell
+      USE mpivars
+      IMPLICIT NONE
+
+      COMPLEX(KIND=GP), INTENT(INOUT), DIMENSION(lmsta:lmend,nz) :: tor,phi
+      COMPLEX(KIND=GP), INTENT(OUT), DIMENSION(lmsta:lmend,nz)   :: pol
+      INTEGER :: n,lm,k,i,fila(4)
+
+      n = nz-Cz
+      fila = (/ 1,2,n-1,n /)
+      CALL dirichlet(tor)
+      CALL invDl(phi,pol)
+      DO lm = lmsta,lmend
+         IF ( ell(lm) .eq. 0 ) THEN
+            phi(lm,:) = 0.0_GP
+            CYCLE
+         ENDIF
+         DO k = 1,4
+            i = fila(k)
+            phi(lm,i) = SUM(d2bor(k,:)*pol(lm,1:n)) - &
+                        ell(lm)*(ell(lm)+1)*pol(lm,i)/z(i)**2
+         END DO
+      END DO
+
+      RETURN
+      END SUBROUTINE v_imposebc_fast
